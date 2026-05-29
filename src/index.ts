@@ -682,6 +682,7 @@ const viewIndexCache = new WeakMap<FrontierViewManifest, FrontierViewIndex>();
 const registryGraphCache = new WeakMap<FrontierViewManifest, FrontierRegistryGraph>();
 const proofHashCache = new WeakMap<FrontierViewManifest, string>();
 const jsonlCache = new WeakMap<FrontierViewManifest, string>();
+const redactedManifestCache = new WeakMap<FrontierViewManifest, Map<string, FrontierViewManifest>>();
 
 interface FrontierViewIndex {
   fieldsById: Map<string, FrontierViewField>;
@@ -892,6 +893,13 @@ export function materializeView(
     }
   }
 
+  let errorCount = 0;
+  let warningCount = 0;
+  for (const issue of issues) {
+    if (issue.severity === 'error') errorCount++;
+    else if (issue.severity === 'warning') warningCount++;
+  }
+
   const summary: FrontierViewSummary = {
     fieldCount: nodes.length,
     actionCount: frameActions.length + nodes.reduce((sum, node) => sum + node.actions.length, 0),
@@ -903,8 +911,8 @@ export function materializeView(
     readonlyCount,
     hiddenCount,
     issueCount: issues.length,
-    errorCount: issues.filter((issue) => issue.severity === 'error').length,
-    warningCount: issues.filter((issue) => issue.severity === 'warning').length
+    errorCount,
+    warningCount
   };
 
   return {
@@ -1136,19 +1144,30 @@ export function encodeViewJsonl(
 }
 
 export function decodeViewJsonl(text: string): FrontierViewManifest {
-  const line = text.split(/\r?\n/).find((part) => part.trim().length !== 0);
+  const line = firstJsonLine(text);
   if (!line) throw new TypeError('frontier view JSONL is empty');
   const decoded = JSON.parse(line) as { manifest?: FrontierViewManifestInput | FrontierViewManifest };
   if (!decoded.manifest) throw new TypeError('frontier view JSONL is missing manifest');
-  return isManifest(decoded.manifest) ? createViewManifest(manifestToInput(decoded.manifest)) : createViewManifest(decoded.manifest);
+  return isManifest(decoded.manifest) ? cloneManifest(decoded.manifest) : createViewManifest(decoded.manifest);
 }
 
 export function redactViewManifest(
   manifest: FrontierViewManifest,
   options: { redactKeys?: readonly string[] } = {}
 ): FrontierViewManifest {
-  const keys = new Set((options.redactKeys ?? ['authorization', 'cookie', 'password', 'secret', 'token']).map((key) => key.toLowerCase()));
-  return createViewManifest(redactUnknown(manifestToInput(manifest), keys) as FrontierViewManifestInput);
+  const keyList = (options.redactKeys ?? ['authorization', 'cookie', 'password', 'secret', 'token']).map((key) => key.toLowerCase()).sort();
+  const cacheKey = keyList.join('\0');
+  const cached = redactedManifestCache.get(manifest)?.get(cacheKey);
+  if (cached) return cloneManifest(cached);
+
+  const redacted = redactUnknown(manifest, new Set(keyList)) as FrontierViewManifest;
+  let cache = redactedManifestCache.get(manifest);
+  if (!cache) {
+    cache = new Map();
+    redactedManifestCache.set(manifest, cache);
+  }
+  cache.set(cacheKey, redacted);
+  return cloneManifest(redacted);
 }
 
 export function createViewProof(manifest: FrontierViewManifest, generatedAt = Date.now()): FrontierViewProof {
@@ -1172,6 +1191,19 @@ export function createViewProof(manifest: FrontierViewManifest, generatedAt = Da
     hash,
     summary: manifest.summary
   };
+}
+
+function firstJsonLine(text: string): string | undefined {
+  let start = 0;
+  for (let index = 0; index <= text.length; index++) {
+    const char = index === text.length ? 10 : text.charCodeAt(index);
+    if (char !== 10 && char !== 13) continue;
+    const line = text.slice(start, index).trim();
+    if (line.length !== 0) return line;
+    start = char === 13 && text.charCodeAt(index + 1) === 10 ? index + 2 : index + 1;
+    if (start !== index + 1) index++;
+  }
+  return undefined;
 }
 
 function normalizeSource(input?: FrontierViewSourceInput): FrontierViewSource | undefined {
@@ -1974,20 +2006,42 @@ function collectActions(manifest: FrontierViewManifest, fields: FrontierViewFiel
 }
 
 function summarizeManifest(manifest: FrontierViewManifest, diagnostics: readonly FrontierViewDiagnostic[]): FrontierViewSummary {
-  const actions = collectActions(manifest, manifest.fields, manifest.flows);
+  const sourcePaths = new Set<string>();
+  const writePaths = new Set<string>();
+  let actionCount = 0;
+  let editableCount = 0;
+  let readonlyCount = 0;
+  let hiddenCount = 0;
+  let errorCount = 0;
+  let warningCount = 0;
+
+  for (const field of manifest.fields) {
+    sourcePaths.add(field.sourcePath);
+    if (field.writePath) writePaths.add(field.writePath);
+    actionCount += field.actions.length;
+    if (!field.readOnly && field.mode !== 'readonly' && field.mode !== 'hidden') editableCount++;
+    if (field.readOnly || field.mode === 'readonly') readonlyCount++;
+    if (field.mode === 'hidden') hiddenCount++;
+  }
+  for (const flow of manifest.flows) actionCount += flow.actions.length + (flow.submit ? 1 : 0);
+  for (const issue of diagnostics) {
+    if (issue.severity === 'error') errorCount++;
+    else if (issue.severity === 'warning') warningCount++;
+  }
+
   return {
     fieldCount: manifest.fields.length,
-    actionCount: actions.length,
+    actionCount,
     representationCount: Object.keys(manifest.representations).length,
     flowCount: manifest.flows.length,
-    sourcePathCount: new Set(manifest.fields.map((field) => field.sourcePath)).size,
-    writePathCount: new Set(manifest.fields.map((field) => field.writePath).filter(isString)).size,
-    editableCount: manifest.fields.filter((field) => !field.readOnly && field.mode !== 'readonly' && field.mode !== 'hidden').length,
-    readonlyCount: manifest.fields.filter((field) => field.readOnly || field.mode === 'readonly').length,
-    hiddenCount: manifest.fields.filter((field) => field.mode === 'hidden').length,
+    sourcePathCount: sourcePaths.size,
+    writePathCount: writePaths.size,
+    editableCount,
+    readonlyCount,
+    hiddenCount,
     issueCount: diagnostics.length,
-    errorCount: diagnostics.filter((issue) => issue.severity === 'error').length,
-    warningCount: diagnostics.filter((issue) => issue.severity === 'warning').length
+    errorCount,
+    warningCount
   };
 }
 
@@ -1997,16 +2051,29 @@ function summarizeQuery(
   actions: readonly FrontierViewAction[],
   representations: readonly FrontierViewRepresentation[]
 ): FrontierViewSummary {
+  const sourcePaths = new Set<string>();
+  const writePaths = new Set<string>();
+  let editableCount = 0;
+  let readonlyCount = 0;
+  let hiddenCount = 0;
+  for (const field of fields) {
+    sourcePaths.add(field.sourcePath);
+    if (field.writePath) writePaths.add(field.writePath);
+    if (!field.readOnly && field.mode !== 'readonly' && field.mode !== 'hidden') editableCount++;
+    if (field.readOnly || field.mode === 'readonly') readonlyCount++;
+    if (field.mode === 'hidden') hiddenCount++;
+  }
+
   return {
     fieldCount: fields.length,
     actionCount: actions.length,
     representationCount: representations.length,
     flowCount: flows.length,
-    sourcePathCount: new Set(fields.map((field) => field.sourcePath)).size,
-    writePathCount: new Set(fields.map((field) => field.writePath).filter(isString)).size,
-    editableCount: fields.filter((field) => !field.readOnly && field.mode !== 'readonly' && field.mode !== 'hidden').length,
-    readonlyCount: fields.filter((field) => field.readOnly || field.mode === 'readonly').length,
-    hiddenCount: fields.filter((field) => field.mode === 'hidden').length,
+    sourcePathCount: sourcePaths.size,
+    writePathCount: writePaths.size,
+    editableCount,
+    readonlyCount,
+    hiddenCount,
     issueCount: 0,
     errorCount: 0,
     warningCount: 0
@@ -2176,13 +2243,37 @@ function fieldMatchesText(field: FrontierViewField, representation: FrontierView
     .some((value) => value.toLowerCase().includes(text));
 }
 
+function cloneManifest(manifest: FrontierViewManifest): FrontierViewManifest {
+  return {
+    kind: manifest.kind,
+    version: manifest.version,
+    id: manifest.id,
+    name: manifest.name,
+    description: manifest.description,
+    source: cloneViewSource(manifest.source),
+    defaults: cloneDefaults(manifest.defaults),
+    fields: manifest.fields.map(cloneField),
+    flows: manifest.flows.map(cloneFlow),
+    representations: cloneRepresentationRecord(manifest.representations),
+    generatedAt: manifest.generatedAt,
+    package: manifest.package,
+    feature: manifest.feature,
+    owner: manifest.owner,
+    sourceLocation: cloneRegistrySource(manifest.sourceLocation),
+    tags: manifest.tags.slice(),
+    diagnostics: manifest.diagnostics.map(cloneDiagnostic),
+    summary: { ...manifest.summary },
+    metadata: cloneJsonObject(manifest.metadata)
+  };
+}
+
 function manifestToInput(manifest: FrontierViewManifest): FrontierViewManifestInput {
   return {
     id: manifest.id,
     name: manifest.name,
     description: manifest.description,
-    source: manifest.source,
-    defaults: Object.fromEntries(Object.entries(manifest.defaults).map(([key, value]) => [key, { representation: value.representation, mode: value.mode, validate: value.validate, metadata: value.metadata }])),
+    source: cloneViewSource(manifest.source),
+    defaults: Object.fromEntries(Object.entries(manifest.defaults).map(([key, value]) => [key, { representation: cloneRepresentation(value.representation), mode: value.mode, validate: value.validate.map(cloneValidationStep), metadata: cloneJsonObject(value.metadata) }])),
     fields: manifest.fields.map(cloneField),
     flows: manifest.flows.map(cloneFlow),
     representations: Object.values(manifest.representations).map(cloneRepresentation),
@@ -2197,19 +2288,96 @@ function manifestToInput(manifest: FrontierViewManifest): FrontierViewManifestIn
 }
 
 function cloneField(field: FrontierViewField): FrontierViewField {
-  return cloneJson(field) as FrontierViewField;
+  return {
+    id: field.id,
+    path: field.path,
+    sourcePath: field.sourcePath,
+    writePath: field.writePath,
+    schemaPath: field.schemaPath,
+    label: field.label,
+    description: field.description,
+    type: field.type,
+    format: field.format,
+    enum: cloneJsonArray(field.enum),
+    required: field.required,
+    readOnly: field.readOnly,
+    writeOnly: field.writeOnly,
+    mode: field.mode,
+    representation: field.representation ? cloneRepresentation(field.representation) : undefined,
+    channels: cloneChannels(field.channels),
+    visibleWhen: cloneCondition(field.visibleWhen),
+    editableWhen: cloneCondition(field.editableWhen),
+    validate: field.validate.map(cloneValidationStep),
+    actions: field.actions.map(cloneAction),
+    virtual: cloneVirtualHint(field.virtual),
+    lod: cloneLodHint(field.lod),
+    order: field.order,
+    feature: field.feature,
+    package: field.package,
+    owner: field.owner,
+    source: cloneRegistrySource(field.source),
+    tags: field.tags.slice(),
+    metadata: cloneJsonObject(field.metadata)
+  };
 }
 
 function cloneFlow(flow: FrontierViewFlow): FrontierViewFlow {
-  return cloneJson(flow) as FrontierViewFlow;
+  return {
+    id: flow.id,
+    label: flow.label,
+    mode: flow.mode,
+    draftFrom: flow.draftFrom,
+    draftPath: flow.draftPath,
+    validate: flow.validate.map(cloneValidationStep),
+    fieldOverrides: cloneJson(flow.fieldOverrides),
+    actions: flow.actions.map(cloneAction),
+    submit: flow.submit ? cloneAction(flow.submit) : undefined,
+    virtual: cloneVirtualHint(flow.virtual),
+    lod: cloneLodHint(flow.lod),
+    tags: flow.tags.slice(),
+    metadata: cloneJsonObject(flow.metadata)
+  };
 }
 
 function cloneAction(action: FrontierViewAction): FrontierViewAction {
-  return cloneJson(action) as FrontierViewAction;
+  return {
+    id: action.id,
+    action: action.action,
+    label: action.label,
+    event: action.event,
+    mode: action.mode,
+    input: cloneJsonValue(action.input),
+    requiresValid: action.requiresValid,
+    requiresDirty: action.requiresDirty,
+    capabilities: action.capabilities.slice(),
+    reads: action.reads.slice(),
+    writes: action.writes.slice(),
+    calls: action.calls.slice(),
+    effects: action.effects.slice(),
+    triggers: action.triggers.slice(),
+    invalidates: action.invalidates.slice(),
+    affects: action.affects.slice(),
+    tags: action.tags.slice(),
+    source: cloneRegistrySource(action.source),
+    metadata: cloneJsonObject(action.metadata)
+  };
 }
 
 function cloneRepresentation(representation: FrontierViewRepresentation): FrontierViewRepresentation {
-  return cloneJson(representation) as FrontierViewRepresentation;
+  return {
+    id: representation.id,
+    kind: representation.kind,
+    target: representation.target,
+    channels: cloneChannels(representation.channels),
+    variants: { ...representation.variants },
+    material: cloneJsonValue(representation.material),
+    shader: cloneJsonValue(representation.shader),
+    attributes: cloneJsonValue(representation.attributes),
+    virtual: cloneVirtualHint(representation.virtual),
+    lod: cloneLodHint(representation.lod),
+    tags: representation.tags.slice(),
+    metadata: cloneJsonObject(representation.metadata)
+  };
 }
 
 function cloneSchema(schema: FrontierViewSchemaLike): FrontierViewSchemaLike {
@@ -2217,11 +2385,156 @@ function cloneSchema(schema: FrontierViewSchemaLike): FrontierViewSchemaLike {
 }
 
 function cloneJson<T>(value: T): T {
-  return JSON.parse(JSON.stringify(value)) as T;
+  const text = JSON.stringify(value);
+  return text === undefined ? value : JSON.parse(text) as T;
 }
 
 function cloneJsonArray(values: readonly unknown[]): JsonValue[] {
   return values.map((value) => toJsonValue(value) ?? null);
+}
+
+function cloneJsonValue(value: JsonValue | undefined): JsonValue | undefined {
+  return value === undefined ? undefined : toJsonValue(value);
+}
+
+function cloneJsonObject(value: JsonObject | undefined): JsonObject | undefined {
+  return value === undefined ? undefined : cloneJson(value);
+}
+
+function cloneViewSource(source: FrontierViewSource | undefined): FrontierViewSource | undefined {
+  if (!source) return undefined;
+  return {
+    path: source.path,
+    schema: source.schema ? cloneSchema(source.schema) : undefined,
+    query: cloneJsonValue(source.query),
+    entity: cloneJsonValue(source.entity),
+    metadata: cloneJsonObject(source.metadata)
+  };
+}
+
+function cloneDefaults(defaults: Record<string, FrontierViewDefault>): Record<string, FrontierViewDefault> {
+  const out: Record<string, FrontierViewDefault> = {};
+  for (const [key, value] of Object.entries(defaults)) {
+    out[key] = {
+      key: value.key,
+      representation: cloneRepresentation(value.representation),
+      mode: value.mode,
+      validate: value.validate.map(cloneValidationStep),
+      metadata: cloneJsonObject(value.metadata)
+    };
+  }
+  return out;
+}
+
+function cloneRepresentationRecord(representations: Record<string, FrontierViewRepresentation>): Record<string, FrontierViewRepresentation> {
+  const out: Record<string, FrontierViewRepresentation> = {};
+  for (const [key, value] of Object.entries(representations)) out[key] = cloneRepresentation(value);
+  return out;
+}
+
+function cloneChannels(channels: Record<string, FrontierViewChannel>): Record<string, FrontierViewChannel> {
+  const out: Record<string, FrontierViewChannel> = {};
+  for (const [key, channel] of Object.entries(channels)) {
+    out[key] = {
+      from: channel.from,
+      value: cloneJsonValue(channel.value),
+      scale: channel.scale,
+      domain: cloneJsonArray(channel.domain),
+      range: cloneJsonArray(channel.range),
+      sort: channel.sort,
+      aggregate: channel.aggregate,
+      axis: cloneJsonObject(channel.axis),
+      legend: cloneJsonObject(channel.legend),
+      transform: cloneJsonValue(channel.transform),
+      updateTriggers: channel.updateTriggers.slice(),
+      metadata: cloneJsonObject(channel.metadata)
+    };
+  }
+  return out;
+}
+
+function cloneValidationStep(step: FrontierViewValidationStep): FrontierViewValidationStep {
+  return {
+    id: step.id,
+    kind: step.kind,
+    code: step.code,
+    path: step.path,
+    message: step.message,
+    severity: step.severity,
+    requires: cloneCondition(step.requires),
+    metadata: cloneJsonObject(step.metadata)
+  };
+}
+
+function cloneVirtualHint(virtual: FrontierViewVirtualHint | undefined): FrontierViewVirtualHint | undefined {
+  if (!virtual) return undefined;
+  return {
+    keyBy: virtual.keyBy,
+    count: virtual.count,
+    itemSize: virtual.itemSize,
+    estimatedSize: virtual.estimatedSize,
+    overscan: virtual.overscan,
+    lanes: virtual.lanes,
+    gap: virtual.gap,
+    paddingStart: virtual.paddingStart,
+    paddingEnd: virtual.paddingEnd,
+    scrollPaddingStart: virtual.scrollPaddingStart,
+    scrollPaddingEnd: virtual.scrollPaddingEnd,
+    scrollMargin: virtual.scrollMargin,
+    initialOffset: virtual.initialOffset,
+    horizontal: virtual.horizontal,
+    enabled: virtual.enabled,
+    measureKey: virtual.measureKey,
+    rangeExtractor: virtual.rangeExtractor,
+    sticky: virtual.sticky.slice(),
+    viewport: cloneJsonValue(virtual.viewport),
+    axis: virtual.axis,
+    rangePath: virtual.rangePath,
+    anchorPath: virtual.anchorPath,
+    metadata: cloneJsonObject(virtual.metadata)
+  };
+}
+
+function cloneLodHint(lod: FrontierViewLodHint | undefined): FrontierViewLodHint | undefined {
+  if (!lod) return undefined;
+  return {
+    profile: lod.profile,
+    level: lod.level,
+    levels: lod.levels.slice(),
+    significance: lod.significance,
+    observer: lod.observer,
+    budget: cloneJsonValue(lod.budget),
+    priority: lod.priority,
+    cost: lod.cost,
+    minZoom: lod.minZoom,
+    maxZoom: lod.maxZoom,
+    hysteresis: lod.hysteresis,
+    degrade: lod.degrade,
+    variants: { ...lod.variants },
+    metadata: cloneJsonObject(lod.metadata)
+  };
+}
+
+function cloneCondition(condition: FrontierViewCondition | undefined): FrontierViewCondition | undefined {
+  return condition === undefined ? undefined : cloneJson(condition) as FrontierViewCondition;
+}
+
+function cloneRegistrySource(source: FrontierRegistrySource | undefined): FrontierRegistrySource | undefined {
+  return source === undefined ? undefined : cloneJson(source) as FrontierRegistrySource;
+}
+
+function cloneDiagnostic(issue: FrontierViewDiagnostic): FrontierViewDiagnostic {
+  return {
+    severity: issue.severity,
+    code: issue.code,
+    message: issue.message,
+    viewId: issue.viewId,
+    fieldId: issue.fieldId,
+    actionId: issue.actionId,
+    path: issue.path,
+    source: issue.source,
+    metadata: cloneJsonObject(issue.metadata)
+  };
 }
 
 function toJsonObject(value: unknown): JsonObject | undefined {

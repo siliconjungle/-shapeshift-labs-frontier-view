@@ -247,6 +247,7 @@ assert.ok(constrainedFrame.issues.some((issue) => issue.code === 'pattern'));
 
 const query = queryViewManifest(view, { representations: ['mark.circle'], paths: ['/profile/metrics'] });
 assert.deepStrictEqual(query.fields.map((field) => field.sourcePath), ['/profile/metrics/score']);
+assert.notStrictEqual(query.fields[0], view.fields.find((field) => field.sourcePath === '/profile/metrics/score'));
 
 const graph = createViewRegistryGraph(view);
 assert.ok(graph.entries.some((entry) => entry.id === 'profile.editor'));
@@ -260,11 +261,15 @@ assert.ok(impact.nodes.includes('entry:profile.save'));
 const jsonl = encodeViewJsonl(view, { redactKeys: ['token'] });
 const decoded = decodeViewJsonl(jsonl);
 assert.strictEqual(decoded.id, view.id);
+assert.notStrictEqual(decoded, view);
 assert.strictEqual(decoded.metadata?.token, '[REDACTED]');
 assert.strictEqual(createViewProof(decoded, 1).hash, createViewProof(decodeViewJsonl(encodeViewJsonl(decoded)), 1).hash);
 
 const redacted = redactViewManifest(view);
+const redactedAgain = redactViewManifest(view);
 assert.strictEqual(redacted.metadata?.token, '[REDACTED]');
+assert.notStrictEqual(redactedAgain, redacted);
+assert.strictEqual(redactedAgain.metadata?.token, '[REDACTED]');
 
 const record = createViewRecord({
   viewId: view.id,
