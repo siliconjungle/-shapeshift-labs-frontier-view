@@ -174,8 +174,14 @@ export interface FrontierViewChannelInput {
   from?: FrontierRegistryPath;
   value?: unknown;
   scale?: string;
+  domain?: readonly JsonValue[];
   range?: readonly JsonValue[];
+  sort?: string;
   aggregate?: string;
+  axis?: unknown;
+  legend?: unknown;
+  transform?: unknown;
+  updateTriggers?: readonly string[];
   metadata?: unknown;
 }
 
@@ -183,16 +189,36 @@ export interface FrontierViewChannel {
   from?: string;
   value?: JsonValue;
   scale?: string;
+  domain: JsonValue[];
   range: JsonValue[];
+  sort?: string;
   aggregate?: string;
+  axis?: JsonObject;
+  legend?: JsonObject;
+  transform?: JsonValue;
+  updateTriggers: string[];
   metadata?: JsonObject;
 }
 
 export interface FrontierViewVirtualHintInput {
   keyBy?: string;
+  count?: number;
   itemSize?: number;
   estimatedSize?: number;
   overscan?: number;
+  lanes?: number;
+  gap?: number;
+  paddingStart?: number;
+  paddingEnd?: number;
+  scrollPaddingStart?: number;
+  scrollPaddingEnd?: number;
+  scrollMargin?: number;
+  initialOffset?: number;
+  horizontal?: boolean;
+  enabled?: boolean;
+  measureKey?: string;
+  rangeExtractor?: string;
+  sticky?: readonly string[];
   viewport?: unknown;
   axis?: 'x' | 'y' | 'both' | string;
   rangePath?: FrontierRegistryPath;
@@ -202,9 +228,23 @@ export interface FrontierViewVirtualHintInput {
 
 export interface FrontierViewVirtualHint {
   keyBy?: string;
+  count?: number;
   itemSize?: number;
   estimatedSize?: number;
   overscan?: number;
+  lanes?: number;
+  gap?: number;
+  paddingStart?: number;
+  paddingEnd?: number;
+  scrollPaddingStart?: number;
+  scrollPaddingEnd?: number;
+  scrollMargin?: number;
+  initialOffset?: number;
+  horizontal?: boolean;
+  enabled?: boolean;
+  measureKey?: string;
+  rangeExtractor?: string;
+  sticky: string[];
   viewport?: JsonValue;
   axis?: string;
   rangePath?: string;
@@ -219,6 +259,12 @@ export interface FrontierViewLodHintInput {
   significance?: FrontierRegistryPath;
   observer?: FrontierRegistryPath;
   budget?: unknown;
+  priority?: number;
+  cost?: number;
+  minZoom?: number;
+  maxZoom?: number;
+  hysteresis?: number;
+  degrade?: string;
   variants?: Record<string, string>;
   metadata?: unknown;
 }
@@ -230,6 +276,12 @@ export interface FrontierViewLodHint {
   significance?: string;
   observer?: string;
   budget?: JsonValue;
+  priority?: number;
+  cost?: number;
+  minZoom?: number;
+  maxZoom?: number;
+  hysteresis?: number;
+  degrade?: string;
   variants: Record<string, string>;
   metadata?: JsonObject;
 }
@@ -621,6 +673,28 @@ const DEFAULT_REPRESENTATIONS: Record<string, string> = {
   object: 'group.section'
 };
 
+const PATH_CACHE_LIMIT = 4096;
+const PATTERN_CACHE_LIMIT = 512;
+
+const pathSegmentCache = new Map<string, JsonPath>();
+const patternCache = new Map<string, RegExp | null>();
+const viewIndexCache = new WeakMap<FrontierViewManifest, FrontierViewIndex>();
+const registryGraphCache = new WeakMap<FrontierViewManifest, FrontierRegistryGraph>();
+const proofHashCache = new WeakMap<FrontierViewManifest, string>();
+const jsonlCache = new WeakMap<FrontierViewManifest, string>();
+
+interface FrontierViewIndex {
+  fieldsById: Map<string, FrontierViewField>;
+  fieldsBySourcePath: Map<string, FrontierViewField[]>;
+  fieldsByWritePath: Map<string, FrontierViewField[]>;
+  fieldsBySourcePrefix: Map<string, FrontierViewField[]>;
+  fieldsByWritePrefix: Map<string, FrontierViewField[]>;
+  fieldsByRepresentation: Map<string, FrontierViewField[]>;
+  fieldsByAction: Map<string, FrontierViewField[]>;
+  flowsById: Map<string, FrontierViewFlow>;
+  actionsById: Map<string, FrontierViewAction>;
+}
+
 export function defineView(input: FrontierViewManifestInput): FrontierViewManifest {
   return createViewManifest(input);
 }
@@ -729,6 +803,7 @@ export function materializeView(
   let editableCount = 0;
   let readonlyCount = 0;
   let hiddenCount = 0;
+  let hasDirtyNode = false;
 
   for (const field of manifest.fields) {
     const merged = mergeFieldFlowOverride(field, flow);
@@ -743,6 +818,7 @@ export function materializeView(
     const readonly = hidden || disabled || mode === 'readonly' || merged.readOnly || !writePath;
     const editable = !hidden && !disabled && !readonly && mode === 'editable';
     const dirty = writePath !== undefined && !jsonEqual(value, sourceValue);
+    if (dirty) hasDirtyNode = true;
     const nodeIssues = validation === 'none' ? [] : validateFieldValue(merged, value, sourceValue, dirty, capabilities, validation);
     for (const issue of nodeIssues) issues[issues.length] = issue;
     if (editable) editableCount++;
@@ -797,7 +873,7 @@ export function materializeView(
       manifest,
       state: options.state,
       issues,
-      dirty: nodes.some((node) => node.dirty),
+      dirty: hasDirtyNode,
       capabilities
     })
   );
@@ -846,6 +922,7 @@ export function materializeView(
 }
 
 export function queryViewManifest(manifest: FrontierViewManifest, query: FrontierViewQueryInput = {}): FrontierViewQueryResult {
+  const index = getViewIndex(manifest);
   const pathQueries = (query.paths ?? []).map(normalizePath);
   const writePathQueries = (query.writePaths ?? []).map(normalizePath);
   const idSet = query.ids ? new Set(query.ids.map(String)) : null;
@@ -858,7 +935,7 @@ export function queryViewManifest(manifest: FrontierViewManifest, query: Frontie
   const limit = query.limit && query.limit > 0 ? Math.floor(query.limit) : Infinity;
 
   const fields: FrontierViewField[] = [];
-  for (const field of manifest.fields) {
+  for (const field of candidateFieldsForQuery(manifest, index, query, pathQueries, writePathQueries)) {
     if (fields.length >= limit) break;
     if (idSet && !idSet.has(field.id)) continue;
     if (pathQueries.length !== 0 && !pathQueries.some((path) => pathsOverlap(path, field.sourcePath))) continue;
@@ -901,6 +978,10 @@ export function createViewRegistryGraph(
   manifest: FrontierViewManifest,
   input: { generatedAt?: number; metadata?: JsonObject } = {}
 ): FrontierRegistryGraph {
+  if (input.generatedAt === undefined && input.metadata === undefined) {
+    const cached = registryGraphCache.get(manifest);
+    if (cached) return cached;
+  }
   const entries: FrontierRegistryEntry[] = [
     {
       id: manifest.id,
@@ -964,15 +1045,18 @@ export function createViewRegistryGraph(
     if (flow.submit) entries[entries.length] = actionEntry(flow.submit, undefined, manifest);
   }
 
-  return createFrontierRegistryGraph({
+  const graph = createFrontierRegistryGraph({
     entries,
     edges,
     generatedAt: input.generatedAt,
     metadata: input.metadata
   });
+  if (input.generatedAt === undefined && input.metadata === undefined) registryGraphCache.set(manifest, graph);
+  return graph;
 }
 
 export function traceViewImpact(manifest: FrontierViewManifest, input: FrontierViewImpactInput = {}): FrontierViewImpact {
+  const index = getViewIndex(manifest);
   const query = input.query ? queryViewManifest(manifest, input.query) : undefined;
   const ids = new Set<string>(input.ids ?? []);
   for (const id of input.fields ?? []) ids.add(id);
@@ -992,7 +1076,7 @@ export function traceViewImpact(manifest: FrontierViewManifest, input: FrontierV
   const fieldIds = impactedEntries.filter((entry) => entry.kind === 'view-field').map((entry) => entry.id).sort();
   const actionIds = impactedEntries.filter((entry) => entry.kind === 'view-action').map((entry) => entry.id).sort();
   const representations = impactedEntries.filter((entry) => entry.kind === 'view-representation').map((entry) => entry.id).sort();
-  const impactedFields = manifest.fields.filter((field) => fieldIds.includes(field.id));
+  const impactedFields = fieldIds.map((id) => index.fieldsById.get(id)).filter(isField);
   return {
     kind: FRONTIER_VIEW_IMPACT_KIND,
     version: FRONTIER_VIEW_IMPACT_VERSION,
@@ -1037,12 +1121,18 @@ export function encodeViewJsonl(
   manifest: FrontierViewManifest,
   options: { redactKeys?: readonly string[] } = {}
 ): string {
+  if (!options.redactKeys) {
+    const cached = jsonlCache.get(manifest);
+    if (cached) return cached;
+  }
   const encoded = {
     kind: FRONTIER_VIEW_JSONL_KIND,
     version: FRONTIER_VIEW_JSONL_VERSION,
     manifest: options.redactKeys ? redactViewManifest(manifest, { redactKeys: options.redactKeys }) : manifest
   };
-  return stableStringify(encoded) + '\n';
+  const text = stableStringify(encoded) + '\n';
+  if (!options.redactKeys) jsonlCache.set(manifest, text);
+  return text;
 }
 
 export function decodeViewJsonl(text: string): FrontierViewManifest {
@@ -1062,19 +1152,24 @@ export function redactViewManifest(
 }
 
 export function createViewProof(manifest: FrontierViewManifest, generatedAt = Date.now()): FrontierViewProof {
-  const stable = stableStringify({
-    id: manifest.id,
-    fields: manifest.fields,
-    flows: manifest.flows,
-    representations: manifest.representations,
-    defaults: manifest.defaults
-  });
+  let hash = proofHashCache.get(manifest);
+  if (!hash) {
+    const stable = stableStringify({
+      id: manifest.id,
+      fields: manifest.fields,
+      flows: manifest.flows,
+      representations: manifest.representations,
+      defaults: manifest.defaults
+    });
+    hash = fnv1a(stable);
+    proofHashCache.set(manifest, hash);
+  }
   return {
     kind: FRONTIER_VIEW_PROOF_KIND,
     version: FRONTIER_VIEW_PROOF_VERSION,
     generatedAt,
     manifestId: manifest.id,
-    hash: fnv1a(stable),
+    hash,
     summary: manifest.summary
   };
 }
@@ -1433,8 +1528,14 @@ function normalizeChannels(input?: Record<string, FrontierViewChannelInput>): Re
       from: channel.from === undefined ? undefined : normalizePath(channel.from),
       value: toJsonValue(channel.value),
       scale: channel.scale,
+      domain: cloneJsonArray(channel.domain ?? []),
       range: cloneJsonArray(channel.range ?? []),
+      sort: channel.sort,
       aggregate: channel.aggregate,
+      axis: toJsonObject(channel.axis),
+      legend: toJsonObject(channel.legend),
+      transform: toJsonValue(channel.transform),
+      updateTriggers: normalizeStrings(channel.updateTriggers),
       metadata: toJsonObject(channel.metadata)
     };
   }
@@ -1445,9 +1546,23 @@ function normalizeVirtual(input?: FrontierViewVirtualHintInput): FrontierViewVir
   if (!input) return undefined;
   return {
     keyBy: input.keyBy,
-    itemSize: input.itemSize,
-    estimatedSize: input.estimatedSize,
-    overscan: input.overscan,
+    count: finiteNumber(input.count),
+    itemSize: finiteNumber(input.itemSize),
+    estimatedSize: finiteNumber(input.estimatedSize),
+    overscan: finiteNumber(input.overscan),
+    lanes: finiteNumber(input.lanes),
+    gap: finiteNumber(input.gap),
+    paddingStart: finiteNumber(input.paddingStart),
+    paddingEnd: finiteNumber(input.paddingEnd),
+    scrollPaddingStart: finiteNumber(input.scrollPaddingStart),
+    scrollPaddingEnd: finiteNumber(input.scrollPaddingEnd),
+    scrollMargin: finiteNumber(input.scrollMargin),
+    initialOffset: finiteNumber(input.initialOffset),
+    horizontal: input.horizontal,
+    enabled: input.enabled,
+    measureKey: input.measureKey,
+    rangeExtractor: input.rangeExtractor,
+    sticky: normalizeStrings(input.sticky),
     viewport: toJsonValue(input.viewport),
     axis: input.axis,
     rangePath: input.rangePath === undefined ? undefined : normalizePath(input.rangePath),
@@ -1465,6 +1580,12 @@ function normalizeLod(input?: FrontierViewLodHintInput): FrontierViewLodHint | u
     significance: input.significance === undefined ? undefined : normalizePath(input.significance),
     observer: input.observer === undefined ? undefined : normalizePath(input.observer),
     budget: toJsonValue(input.budget),
+    priority: finiteNumber(input.priority),
+    cost: finiteNumber(input.cost),
+    minZoom: finiteNumber(input.minZoom),
+    maxZoom: finiteNumber(input.maxZoom),
+    hysteresis: finiteNumber(input.hysteresis),
+    degrade: input.degrade,
     variants: normalizeStringRecord(input.variants),
     metadata: toJsonObject(input.metadata)
   };
@@ -1494,8 +1615,118 @@ function normalizeId(value: string, label: string): string {
   return id;
 }
 
+function getViewIndex(manifest: FrontierViewManifest): FrontierViewIndex {
+  const cached = viewIndexCache.get(manifest);
+  if (cached) return cached;
+
+  const index: FrontierViewIndex = {
+    fieldsById: new Map(),
+    fieldsBySourcePath: new Map(),
+    fieldsByWritePath: new Map(),
+    fieldsBySourcePrefix: new Map(),
+    fieldsByWritePrefix: new Map(),
+    fieldsByRepresentation: new Map(),
+    fieldsByAction: new Map(),
+    flowsById: new Map(),
+    actionsById: new Map()
+  };
+
+  for (const flow of manifest.flows) {
+    index.flowsById.set(flow.id, flow);
+    for (const action of flow.actions) index.actionsById.set(action.id, action);
+    if (flow.submit) index.actionsById.set(flow.submit.id, flow.submit);
+  }
+
+  for (const field of manifest.fields) {
+    index.fieldsById.set(field.id, field);
+    addMappedValue(index.fieldsBySourcePath, field.sourcePath, field);
+    addPathPrefixes(index.fieldsBySourcePrefix, field.sourcePath, field);
+    if (field.writePath) {
+      addMappedValue(index.fieldsByWritePath, field.writePath, field);
+      addPathPrefixes(index.fieldsByWritePrefix, field.writePath, field);
+    }
+    const representation = resolveFieldRepresentation(manifest, field);
+    addMappedValue(index.fieldsByRepresentation, representation.id, field);
+    addMappedValue(index.fieldsByRepresentation, representation.kind, field);
+    for (const action of field.actions) {
+      index.actionsById.set(action.id, action);
+      addMappedValue(index.fieldsByAction, action.id, field);
+      addMappedValue(index.fieldsByAction, action.action, field);
+    }
+  }
+
+  viewIndexCache.set(manifest, index);
+  return index;
+}
+
+function candidateFieldsForQuery(
+  manifest: FrontierViewManifest,
+  index: FrontierViewIndex,
+  query: FrontierViewQueryInput,
+  pathQueries: readonly string[],
+  writePathQueries: readonly string[]
+): readonly FrontierViewField[] {
+  const candidateSets: FrontierViewField[][] = [];
+
+  if (query.ids?.length) {
+    candidateSets[candidateSets.length] = query.ids
+      .map((id) => index.fieldsById.get(String(id)))
+      .filter(isField);
+  }
+  if (pathQueries.length) candidateSets[candidateSets.length] = unionFieldLists(pathQueries.map((path) => fieldsOverlappingPath(index.fieldsBySourcePath, index.fieldsBySourcePrefix, path)));
+  if (writePathQueries.length) candidateSets[candidateSets.length] = unionFieldLists(writePathQueries.map((path) => fieldsOverlappingPath(index.fieldsByWritePath, index.fieldsByWritePrefix, path)));
+  if (query.representations?.length) candidateSets[candidateSets.length] = unionFieldLists(query.representations.map((id) => index.fieldsByRepresentation.get(String(id)) ?? []));
+  if (query.actions?.length) candidateSets[candidateSets.length] = unionFieldLists(query.actions.map((id) => index.fieldsByAction.get(String(id)) ?? []));
+
+  if (candidateSets.length === 0) return manifest.fields;
+  let best = candidateSets[0] ?? [];
+  for (let i = 1; i < candidateSets.length; i++) {
+    const next = candidateSets[i] ?? [];
+    if (next.length < best.length) best = next;
+  }
+  return best;
+}
+
+function fieldsOverlappingPath(
+  exact: Map<string, FrontierViewField[]>,
+  prefixes: Map<string, FrontierViewField[]>,
+  path: string
+): FrontierViewField[] {
+  const fields = new Set<FrontierViewField>(prefixes.get(path) ?? []);
+  for (const prefix of pathPrefixes(path)) {
+    for (const field of exact.get(prefix) ?? []) fields.add(field);
+  }
+  return Array.from(fields);
+}
+
+function addPathPrefixes(map: Map<string, FrontierViewField[]>, path: string, field: FrontierViewField): void {
+  for (const prefix of pathPrefixes(path)) addMappedValue(map, prefix, field);
+}
+
+function pathPrefixes(path: string): string[] {
+  const parts = pathToArray(path);
+  const prefixes = ['/'];
+  for (let i = 1; i <= parts.length; i++) prefixes[prefixes.length] = normalizePath(parts.slice(0, i));
+  return prefixes;
+}
+
+function unionFieldLists(lists: readonly (readonly FrontierViewField[])[]): FrontierViewField[] {
+  const fields = new Set<FrontierViewField>();
+  for (const list of lists) for (const field of list) fields.add(field);
+  return Array.from(fields);
+}
+
+function addMappedValue<T>(map: Map<string, T[]>, key: string, value: T): void {
+  const values = map.get(key);
+  if (values) {
+    if (!values.includes(value)) values[values.length] = value;
+  } else {
+    map.set(key, [value]);
+  }
+}
+
 function findFlow(manifest: FrontierViewManifest, id: string | undefined): FrontierViewFlow | undefined {
-  if (id) return manifest.flows.find((flow) => flow.id === id);
+  if (id) return getViewIndex(manifest).flowsById.get(id);
   return manifest.flows[0];
 }
 
@@ -1616,11 +1847,11 @@ function issueForValidation(
     if (max !== undefined && length > max) return validationIssue(field, step, 'length.maximum', field.label + ' is too long');
   }
   if (code === 'pattern' && typeof value === 'string' && typeof step.metadata?.pattern === 'string') {
-    try {
-      if (!new RegExp(step.metadata.pattern).test(value)) return validationIssue(field, step, 'pattern', field.label + ' does not match the required pattern');
-    } catch {
+    const pattern = compiledPattern(step.metadata.pattern);
+    if (!pattern) {
       return validationIssue(field, step, 'pattern.invalid', field.label + ' has an invalid pattern validator');
     }
+    if (!pattern.test(value)) return validationIssue(field, step, 'pattern', field.label + ' does not match the required pattern');
   }
   if (code === 'dirty' && !dirty && jsonEqual(value, sourceValue)) {
     return validationIssue(field, step, 'dirty', field.label + ' has no changes');
@@ -1651,6 +1882,19 @@ function validationIssue(
 function metadataNumber(metadata: JsonObject | undefined, key: string): number | undefined {
   const value = metadata?.[key];
   return typeof value === 'number' && Number.isFinite(value) ? value : undefined;
+}
+
+function compiledPattern(pattern: string): RegExp | null {
+  if (patternCache.has(pattern)) return patternCache.get(pattern) ?? null;
+  let compiled: RegExp | null = null;
+  try {
+    compiled = new RegExp(pattern);
+  } catch {
+    compiled = null;
+  }
+  if (patternCache.size >= PATTERN_CACHE_LIMIT) patternCache.clear();
+  patternCache.set(pattern, compiled);
+  return compiled;
 }
 
 function materializeAction(
@@ -1845,9 +2089,16 @@ function getPathValue(value: JsonValue | undefined, path: FrontierRegistryPath):
 function pathToArray(path: FrontierRegistryPath): JsonPath {
   if (Array.isArray(path)) return path.map((segment) => (typeof segment === 'number' ? segment : numericOrString(segment)));
   const value = String(path);
-  if (value === '' || value === '/') return [];
-  if (value.startsWith('/')) return value.slice(1).split('/').filter(Boolean).map((part) => numericOrString(unescapePointerToken(part)));
-  return value.split('.').filter(Boolean).map(numericOrString);
+  const cached = pathSegmentCache.get(value);
+  if (cached) return cached;
+  const parsed = value === '' || value === '/'
+    ? []
+    : value.startsWith('/')
+      ? value.slice(1).split('/').filter(Boolean).map((part) => numericOrString(unescapePointerToken(part)))
+      : value.split('.').filter(Boolean).map(numericOrString);
+  if (pathSegmentCache.size >= PATH_CACHE_LIMIT) pathSegmentCache.clear();
+  pathSegmentCache.set(value, parsed);
+  return parsed;
 }
 
 function numericOrString(value: string | number): PathSegment {
@@ -1856,9 +2107,7 @@ function numericOrString(value: string | number): PathSegment {
 }
 
 function joinPath(base: string, segment: string): string {
-  const parts = pathToArray(base);
-  parts[parts.length] = segment;
-  return normalizePath(parts);
+  return normalizePath(pathToArray(base).concat(segment));
 }
 
 function rebasePath(path: string, fromRoot: string | undefined, toRoot: string): string {
@@ -1983,10 +2232,16 @@ function toJsonObject(value: unknown): JsonObject | undefined {
 
 function toJsonValue(value: unknown): JsonValue | undefined {
   if (value === undefined) return undefined;
-  return JSON.parse(JSON.stringify(value)) as JsonValue;
+  if (value === null || typeof value === 'string' || typeof value === 'boolean') return value;
+  if (typeof value === 'number') return Number.isFinite(value) ? value : undefined;
+  const text = JSON.stringify(value);
+  return text === undefined ? undefined : JSON.parse(text) as JsonValue;
 }
 
 function jsonEqual(left: unknown, right: unknown): boolean {
+  if (left === right) return true;
+  if (left === null || right === null) return left === right;
+  if (typeof left !== 'object' || typeof right !== 'object') return false;
   return stableStringify(left) === stableStringify(right);
 }
 
@@ -2029,8 +2284,16 @@ function compareNumber(left: number | undefined, right: number | undefined): num
   return (left ?? Number.MAX_SAFE_INTEGER) - (right ?? Number.MAX_SAFE_INTEGER);
 }
 
+function finiteNumber(value: number | undefined): number | undefined {
+  return typeof value === 'number' && Number.isFinite(value) ? value : undefined;
+}
+
 function isString(value: unknown): value is string {
   return typeof value === 'string' && value.length !== 0;
+}
+
+function isField(value: FrontierViewField | undefined): value is FrontierViewField {
+  return value !== undefined;
 }
 
 function arraysEqual(left: readonly unknown[], right: readonly unknown[]): boolean {

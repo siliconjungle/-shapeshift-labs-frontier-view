@@ -34,8 +34,8 @@ for (let caseIndex = 0; caseIndex < cases; caseIndex++) {
       representation: representationForKind(kind),
       validate: validationForKind(kind),
       editableWhen: i % 5 === 0 ? { capability: 'cap.' + (i % 4) } : undefined,
-      virtual: i % 7 === 0 ? { keyBy: 'id', estimatedSize: 24 + (i % 8), overscan: i % 5 } : undefined,
-      lod: i % 9 === 0 ? { profile: 'lod.' + (i % 3), levels: ['full', 'small', 'dot'], significance: sourcePath } : undefined,
+      virtual: i % 7 === 0 ? { keyBy: 'id', count: fieldCount, estimatedSize: 24 + (i % 8), overscan: i % 5, lanes: 1 + (i % 3), gap: i % 4, measureKey: 'measure.' + i } : undefined,
+      lod: i % 9 === 0 ? { profile: 'lod.' + (i % 3), levels: ['full', 'small', 'dot'], significance: sourcePath, priority: i % 5, cost: i / 10, degrade: 'dot' } : undefined,
       tags: ['fuzz', kind]
     };
   }
@@ -83,7 +83,9 @@ for (let caseIndex = 0; caseIndex < cases; caseIndex++) {
     assert.ok(node.sourcePath.startsWith('/entity/'));
     assert.strictEqual(typeof node.representation.kind, 'string');
     if (node.virtual) assert.ok(node.virtual.estimatedSize === undefined || node.virtual.estimatedSize > 0);
+    if (node.virtual) assert.ok(node.virtual.lanes === undefined || node.virtual.lanes >= 1);
     if (node.lod) assert.ok(node.lod.levels.length > 0);
+    if (node.lod?.degrade) assert.ok(node.lod.levels.includes(node.lod.degrade));
   }
 
   const sampleField = manifest.fields[randInt(0, manifest.fields.length - 1)];
@@ -127,7 +129,7 @@ function alternateValueForKind(kind, index) {
 }
 
 function representationForKind(kind) {
-  if (kind === 'number') return randInt(0, 1) === 0 ? 'field.number' : { kind: 'mark.bar', target: 'canvas', channels: { y: { value: randInt(0, 100) } } };
+  if (kind === 'number') return randInt(0, 1) === 0 ? 'field.number' : { kind: 'mark.bar', target: 'canvas', channels: { y: { value: randInt(0, 100), domain: [0, 100], axis: { title: 'Value' }, updateTriggers: ['value'] } } };
   if (kind === 'boolean') return 'field.toggle';
   if (kind === 'enum') return 'field.select';
   return 'field.text';

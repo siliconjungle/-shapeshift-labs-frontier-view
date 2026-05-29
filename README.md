@@ -180,7 +180,8 @@ console.log(frame.summary.editableCount, frame.actions[0]?.ready, impact.viewIds
 - `materializeView()` emits a host-neutral `ViewFrame`. Renderers decide whether `field.email`, `collection.table`, `mark.circle`, or `shader.uniforms` becomes DOM, Canvas, WebGL, WebGPU, native UI, SVG, or server output.
 - Validation is staged and inspectable. The package includes lightweight built-in checks for required, type, enum, min/max, length, pattern, email, dirty, capability, and action readiness. Full JSON Schema, Zod, AJV, server, and async checks remain structural adapters above this package.
 - Actions are descriptors, not callbacks. A submit button, keyboard shortcut, pointer gesture, game event, or AI tool can map view state into an action input while `frontier-mutation`, `frontier-triggers`, and `frontier-effects` remain optional peers.
-- Virtualization and LOD are hints. `frontier-view` can carry viewport, key, estimate, overscan, significance, representation variant, budget, and shader/material metadata, while `frontier-virtual`, `frontier-lod`, `frontier-scene`, or app renderers own the actual materialization.
+- Virtualization and LOD are hints. `frontier-view` can carry viewport, count, key, estimate, lane, gap, padding, measurement, range extraction, significance, priority, cost, zoom, degradation, representation variant, budget, and shader/material metadata, while `frontier-virtual`, `frontier-lod`, `frontier-scene`, or app renderers own the actual materialization.
+- Visual channels can carry data paths, constants, scale/domain/range, axis/legend metadata, transforms, and update-trigger keys without binding the package to SVG, Canvas, WebGL, WebGPU, DOM, React, or a charting runtime.
 
 ## Boundary
 

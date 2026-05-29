@@ -23,7 +23,25 @@ const input = {
       validate: ['required', 'email'],
       representation: {
         kind: 'field.email',
-        target: 'any'
+        target: 'any',
+        channels: {
+          value: {
+            from: '/profile/email',
+            domain: ['a@example.test', 'b@example.test'],
+            updateTriggers: ['profile.email']
+          }
+        },
+        virtual: {
+          count: 2,
+          lanes: 1,
+          gap: 4,
+          measureKey: 'email-row'
+        },
+        lod: {
+          levels: ['full', 'compact'],
+          priority: 1,
+          degrade: 'compact'
+        }
       }
     }
   }
@@ -38,3 +56,5 @@ const frame: FrontierViewFrame = materializeView(manifest, {
 });
 
 frame.nodes[0]?.representation.kind satisfies string;
+frame.nodes[0]?.representation.virtual?.lanes satisfies number | undefined;
+frame.nodes[0]?.representation.channels.value.updateTriggers satisfies string[] | undefined;

@@ -47,13 +47,28 @@ const view = createViewManifest({
       kind: 'mark.circle',
       target: 'canvas',
       channels: {
-        x: { from: '/profile/metrics/score', scale: 'linear' },
-        color: { value: 'green' }
+        x: {
+          from: '/profile/metrics/score',
+          scale: 'linear',
+          domain: [0, 100],
+          axis: { title: 'Score' },
+          updateTriggers: ['profile.metrics.score']
+        },
+        color: {
+          value: 'green',
+          legend: { title: 'Status' }
+        }
       },
       lod: {
         profile: 'profile-minimap',
         levels: ['full', 'dot'],
         significance: '/profile/metrics/score',
+        priority: 2,
+        cost: 0.5,
+        minZoom: 0,
+        maxZoom: 8,
+        hysteresis: 0.25,
+        degrade: 'dot',
         variants: { full: 'profile-card', dot: 'profile-dot' }
       }
     },
@@ -83,8 +98,17 @@ const view = createViewManifest({
       writePath: '/draft/profile/metrics/score',
       virtual: {
         keyBy: 'id',
+        count: 1000,
         estimatedSize: 32,
         overscan: 8,
+        lanes: 2,
+        gap: 4,
+        paddingStart: 12,
+        paddingEnd: 12,
+        scrollMargin: 24,
+        measureKey: 'profile-score-row',
+        rangeExtractor: 'sticky-active',
+        sticky: ['header'],
         rangePath: '/view/ranges/profile'
       },
       validate: ['dirty']
@@ -175,7 +199,17 @@ const scoreNode = frame.nodes.find((node) => node.sourcePath === '/profile/metri
 assert.ok(scoreNode);
 assert.strictEqual(scoreNode.representation.target, 'canvas');
 assert.strictEqual(scoreNode.virtual?.overscan, 8);
+assert.strictEqual(scoreNode.virtual?.lanes, 2);
+assert.strictEqual(scoreNode.virtual?.gap, 4);
+assert.strictEqual(scoreNode.virtual?.measureKey, 'profile-score-row');
+assert.deepStrictEqual(scoreNode.virtual?.sticky, ['header']);
 assert.strictEqual(scoreNode.lod?.profile, 'profile-minimap');
+assert.strictEqual(scoreNode.lod?.priority, 2);
+assert.strictEqual(scoreNode.lod?.degrade, 'dot');
+assert.deepStrictEqual(scoreNode.channels.x.domain, [0, 100]);
+assert.deepStrictEqual(scoreNode.channels.x.axis, { title: 'Score' });
+assert.deepStrictEqual(scoreNode.channels.x.updateTriggers, ['profile.metrics.score']);
+assert.deepStrictEqual(scoreNode.channels.color.legend, { title: 'Status' });
 assert.strictEqual(scoreNode.dirty, true);
 
 const blocked = materializeView(view, {
